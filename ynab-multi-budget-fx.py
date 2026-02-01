@@ -291,6 +291,15 @@ def sync_batch(client: ynab.ApiClient, budget_id: str, transactions: list[dict])
     return len(response.data.transaction_ids)
 
 
+def update_batch(client: ynab.ApiClient, budget_id: str, transactions: list[dict]) -> int:
+    if not transactions:
+        return 0
+    api = ynab.TransactionsApi(client)
+    wrapper = ynab.PatchTransactionsWrapper(transactions=transactions)
+    response = api.update_transactions(budget_id, wrapper)
+    return len(response.data.transactions)
+
+
 def prompt_config(client: ynab.ApiClient | None = None, api_key: str | None = None) -> dict:
     if not api_key:
         api_key = questionary.password("YNAB API Key:").ask()
@@ -414,11 +423,12 @@ def main():
     with console.status("Loading transactions..."):
         src_txs = load_transactions(client, cfg["src_budget_id"], cfg["cutoff_date"])
         dest_txs = load_transactions(client, cfg["dest_budget_id"], cfg["cutoff_date"])
-        existing_import_ids = {tx.import_id for tx in dest_txs if tx.import_id}
+        existing_by_import_id = {tx.import_id: tx for tx in dest_txs if tx.import_id}
 
     console.print(f"Found {len(src_txs)} transactions in source budget since {cfg['cutoff_date']}")
 
     to_sync = []
+    to_update = []
     unique_dates = set()
 
     base_currency = cfg["src_currency"]
@@ -429,62 +439,136 @@ def main():
     for tx in src_txs:
         if tx.payee_name == "<IGNORE>":
             continue
-        if get_import_id(tx) in existing_import_ids:
-            continue
         if tx.account_id not in acc_map:
             continue
-        to_sync.append(tx)
+        import_id = get_import_id(tx)
+        if import_id in existing_by_import_id:
+            to_update.append((tx, existing_by_import_id[import_id]))
+        else:
+            to_sync.append(tx)
         tx_date = tx.var_date
         unique_dates.add(tx_date)
 
-    if not to_sync:
-        console.print("[yellow]No new transactions to sync.[/yellow]")
+    if not to_sync and not to_update:
+        console.print("[yellow]No new transactions to sync or update.[/yellow]")
     else:
-        console.print(f"[cyan]{len(to_sync)} transactions to sync[/cyan]\n")
-
-        rates = fetch_fx_rates(base_currency, target_currency, unique_dates)
-
-        converted = []
-        for tx in to_sync:
-            tx_date = tx.var_date
-            rate = rates[tx_date]
-            conv = convert_transaction(
-                tx,
-                rate,
-                cat_map,
-                acc_map,
-                base_currency,
-                src_decimals,
-            )
-            if conv:
-                converted.append(conv)
-
-        table = Table(title="Transactions to Sync")
-        table.add_column("Date", style="cyan")
-        table.add_column("Payee")
-        table.add_column(f"Original ({base_currency})", justify="right")
-        table.add_column(f"Converted ({target_currency})", justify="right", style="green")
-
-        for i, (tx, conv) in enumerate(zip(to_sync, converted)):
-            if i >= 20:
-                table.add_row("...", f"({len(to_sync) - 20} more)", "", "")
-                break
-            orig_amt = milliunits_to_amount(tx.amount, src_decimals)
-            conv_amt = milliunits_to_amount(conv["amount"], dest_decimals)
-            table.add_row(
-                str(tx.var_date),
-                tx.payee_name or "(no payee)",
-                f"{orig_amt:.{src_decimals}f}",
-                f"{conv_amt:.{dest_decimals}f}",
-            )
-        console.print(table)
-
-        if questionary.confirm("Proceed with sync?", default=True).ask():
-            with console.status("Syncing transactions..."):
-                count = sync_batch(client, cfg["dest_budget_id"], converted)
-            console.print(f"[green]✓ Synced {count} transactions[/green]\n")
+        if unique_dates:
+            rates = fetch_fx_rates(base_currency, target_currency, unique_dates)
         else:
-            console.print("[yellow]Sync cancelled.[/yellow]")
+            rates = {}
+
+        # Handle new transactions
+        if to_sync:
+            console.print(f"[cyan]{len(to_sync)} new transactions to sync[/cyan]\n")
+
+            converted = []
+            for tx in to_sync:
+                tx_date = tx.var_date
+                rate = rates[tx_date]
+                conv = convert_transaction(
+                    tx,
+                    rate,
+                    cat_map,
+                    acc_map,
+                    base_currency,
+                    src_decimals,
+                )
+                if conv:
+                    converted.append(conv)
+
+            table = Table(title="Transactions to Sync")
+            table.add_column("Date", style="cyan")
+            table.add_column("Payee")
+            table.add_column(f"Original ({base_currency})", justify="right")
+            table.add_column(f"Converted ({target_currency})", justify="right", style="green")
+
+            for i, (tx, conv) in enumerate(zip(to_sync, converted)):
+                if i >= 20:
+                    table.add_row("...", f"({len(to_sync) - 20} more)", "", "")
+                    break
+                orig_amt = milliunits_to_amount(tx.amount, src_decimals)
+                conv_amt = milliunits_to_amount(conv["amount"], dest_decimals)
+                table.add_row(
+                    str(tx.var_date),
+                    tx.payee_name or "(no payee)",
+                    f"{orig_amt:.{src_decimals}f}",
+                    f"{conv_amt:.{dest_decimals}f}",
+                )
+            console.print(table)
+
+            if questionary.confirm("Proceed with sync?", default=True).ask():
+                with console.status("Syncing transactions..."):
+                    count = sync_batch(client, cfg["dest_budget_id"], converted)
+                console.print(f"[green]✓ Synced {count} transactions[/green]\n")
+            else:
+                console.print("[yellow]Sync cancelled.[/yellow]")
+        else:
+            console.print("[yellow]No new transactions to sync.[/yellow]")
+
+        # Handle updates to existing transactions
+        if to_update:
+            updates_needed = []
+            for src_tx, dest_tx in to_update:
+                tx_date = src_tx.var_date
+                rate = rates[tx_date]
+                conv = convert_transaction(
+                    src_tx,
+                    rate,
+                    cat_map,
+                    acc_map,
+                    base_currency,
+                    src_decimals,
+                )
+                if not conv:
+                    continue
+
+                # Check if amount or memo changed
+                amount_changed = conv["amount"] != dest_tx.amount
+                memo_changed = conv["memo"] != (dest_tx.memo or "")
+
+                if amount_changed or memo_changed:
+                    update_data = {"id": dest_tx.id}
+                    if amount_changed:
+                        update_data["amount"] = conv["amount"]
+                    if memo_changed:
+                        update_data["memo"] = conv["memo"]
+                    updates_needed.append((src_tx, dest_tx, conv, update_data, amount_changed, memo_changed))
+
+            if updates_needed:
+                console.print(f"\n[cyan]{len(updates_needed)} transactions need updates[/cyan]\n")
+
+                table = Table(title="Transactions to Update")
+                table.add_column("Date", style="cyan")
+                table.add_column("Payee")
+                table.add_column("Changes", style="yellow")
+
+                for i, (src_tx, dest_tx, conv, update_data, amount_changed, memo_changed) in enumerate(updates_needed):
+                    if i >= 20:
+                        table.add_row("...", f"({len(updates_needed) - 20} more)", "")
+                        break
+                    changes = []
+                    if amount_changed:
+                        old_amt = milliunits_to_amount(dest_tx.amount, dest_decimals)
+                        new_amt = milliunits_to_amount(conv["amount"], dest_decimals)
+                        changes.append(f"amount: {old_amt:.{dest_decimals}f} → {new_amt:.{dest_decimals}f}")
+                    if memo_changed:
+                        changes.append("memo updated")
+                    table.add_row(
+                        str(src_tx.var_date),
+                        src_tx.payee_name or "(no payee)",
+                        ", ".join(changes),
+                    )
+                console.print(table)
+
+                if questionary.confirm("Proceed with updates?", default=True).ask():
+                    with console.status("Updating transactions..."):
+                        update_list = [u[3] for u in updates_needed]
+                        count = update_batch(client, cfg["dest_budget_id"], update_list)
+                    console.print(f"[green]✓ Updated {count} transactions[/green]\n")
+                else:
+                    console.print("[yellow]Updates cancelled.[/yellow]")
+            else:
+                console.print("[dim]No existing transactions need updates.[/dim]")
 
     # this api doesn't support today's
     yesterday = date.today() - timedelta(days=1)
