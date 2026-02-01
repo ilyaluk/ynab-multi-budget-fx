@@ -18,10 +18,42 @@ from ynab.rest import ApiException
 console = Console()
 CONFIG_PATH = Path.home() / ".local/share/ynab-multi-budget-fx/config.json"
 RATES_CACHE_PATH = Path.home() / ".local/share/ynab-multi-budget-fx/rates_cache.json"
+CURRENCY_DATA_PATH = Path.home() / ".local/share/ynab-multi-budget-fx/currency_data.json"
+CURRENCY_DATA_URL = "https://raw.githubusercontent.com/tammoippen/iso4217parse/refs/heads/master/iso4217parse/data.json"
 
 
 def milliunits_to_amount(milliunits: int, decimal_digits: int) -> float:
     return milliunits / (10 ** (decimal_digits + 1))
+
+
+def load_currency_data() -> dict:
+    """Load currency data from cache or fetch from URL."""
+    if CURRENCY_DATA_PATH.exists():
+        return json.loads(CURRENCY_DATA_PATH.read_text())
+    try:
+        resp = httpx.get(CURRENCY_DATA_URL, timeout=10, follow_redirects=True)
+        if resp.status_code == 200:
+            data = resp.json()
+            CURRENCY_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CURRENCY_DATA_PATH.write_text(json.dumps(data))
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+_currency_data: dict | None = None
+
+
+def get_currency_symbol(iso_code: str) -> str | None:
+    """Get currency symbol from ISO code, or return the code if no symbol available."""
+    global _currency_data
+    if _currency_data is None:
+        _currency_data = load_currency_data()
+    currency = _currency_data.get(iso_code.upper(), {})
+    if symbols := currency.get("symbols"):
+        return symbols[0]
+    return None
 
 
 def load_config() -> dict | None:
@@ -237,11 +269,18 @@ def convert_transaction(
     orig_amount = milliunits_to_amount(tx.amount, decimal_digits)
     new_amount = int(tx.amount * rate)
 
+    fx_info = f"{abs(orig_amount):,.{decimal_digits}f} {base_currency} @{1 / rate:.2f}"
+    if symbol := get_currency_symbol(base_currency):
+        fx_info = f"{abs(orig_amount):,.{decimal_digits}f}{symbol} @{1 / rate:.2f}"
+
     memo = tx.memo or ""
-    fx_info = f" ({orig_amount:.{decimal_digits}f} {base_currency} @{1 / rate:.2f})"
-    if len(memo) + len(fx_info) > 200:
-        memo = memo[: 200 - len(fx_info) - 1] + "…"
-    memo = memo + fx_info
+    if memo:
+        memo += f" / {fx_info}"
+    else:
+        memo = fx_info
+
+    if len(memo) > 200:
+        memo = memo[: 200 - 1] + "…"
 
     subtransactions = None
     category_id = None
