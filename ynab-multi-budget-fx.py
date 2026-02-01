@@ -158,7 +158,7 @@ def fetch_fx_rates(base: str, target: str, dates: set[date]) -> dict[date, float
             dates_to_fetch.add(d)
 
     if not dates_to_fetch:
-        console.print(f"[dim]All {len(dates)} rates loaded from cache[/dim]")
+        console.print("[dim]All rates loaded from cache[/dim]")
         return rates
 
     if len(dates) > len(dates_to_fetch):
@@ -336,6 +336,10 @@ def update_batch(client: ynab.ApiClient, budget_id: str, transactions: list[dict
     api = ynab.TransactionsApi(client)
     wrapper = ynab.PatchTransactionsWrapper(transactions=transactions)
     response = api.update_transactions(budget_id, wrapper)
+    if not response:
+        # for some reason, API sometimes retuns None instead of correct object, warn about it and assume it's successful
+        console.print("[yellow]Warning: API returned None on update_transactions, assuming success.[/yellow]")
+        return len(transactions)
     return len(response.data.transactions)
 
 
@@ -629,9 +633,6 @@ def main():
         dest_balance = dest_balances.get(acc["name"], 0)
         diff = converted_balance - dest_balance
 
-        if abs(diff) < 10:
-            continue
-
         diff_display = milliunits_to_amount(diff, dest_decimals)
         console.print(f"\n[cyan]{acc['name']}:[/cyan]")
         console.print(
@@ -644,6 +645,10 @@ def main():
             f"  Dest balance:   {milliunits_to_amount(dest_balance, dest_decimals):.{dest_decimals}f} {target_currency}"
         )
         console.print(f"  Difference:     {diff_display:+.{dest_decimals}f} {target_currency}")
+
+        if diff_display < 1:
+            console.print("[yellow]Balance diff is less than 1 {target_currency}, skipping adjustment.[/yellow]")
+            continue
 
         if questionary.confirm(
             f"Create adjustment of {diff_display:+.{dest_decimals}f} {target_currency}?",
