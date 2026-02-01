@@ -34,6 +34,14 @@ On first run, you'll be prompted for:
 
 Configuration is cached in `~/.local/share/ynab-multi-budget-fx/config.json`.
 
+## Data Storage
+
+All data is stored in `~/.local/share/ynab-multi-budget-fx/`:
+
+- `config.json` - Budget IDs, API key, cutoff date, adjustment category
+- `rates_cache.json` - Cached FX rates (keyed by `base:target:date`)
+- `currency_data.json` - ISO 4217 currency symbols for memo formatting
+
 ## How It Works
 
 1. **Validation** - Maps categories and accounts between budgets by name. Source budget must have a subset of the categories and accounts of the destination budget.
@@ -41,10 +49,12 @@ Configuration is cached in `~/.local/share/ynab-multi-budget-fx/config.json`.
 2. **Transaction sync** - Fetches transactions from the source budget since the cutoff date. For each new transaction:
    - Converts the amount using daily FX rates
    - Maps category and account IDs to the destination budget
-   - Appends FX info to memo: `(original_amount currency @rate)`
-   - Sets `import_id` to `MB:<orig_tx_id>` to implement matching
+   - Appends FX info to memo (e.g., `100.00€ @1.05` or `100.00 EUR @1.05`)
+   - Sets `import_id` to `MB:<orig_tx_id>` to track synced transactions
 
-3. **Balance adjustments** - After syncing, compares account balances and offers to create adjustment transactions for any discrepancies.
+3. **Transaction updates** - Previously synced transactions are detected via `import_id` and updated if the source transaction's amount or memo has changed.
+
+4. **Balance adjustments** - After syncing, compares account balances and offers to create adjustment transactions for any discrepancies (only for differences ≥1 in target currency).
 
 ## Special Cases
 
@@ -55,6 +65,10 @@ Configuration is cached in `~/.local/share/ynab-multi-budget-fx/config.json`.
 ## FX Data
 
 Uses the [Exchange API](https://github.com/fawazahmed0/exchange-api) for historical exchange rates.
+
+- Rates are fetched in parallel and cached locally to avoid redundant API calls
+- If a rate is unavailable for a specific date, automatically falls back to the previous day
+- Multiple CDN endpoints are tried for reliability
 
 ## Dependencies
 
