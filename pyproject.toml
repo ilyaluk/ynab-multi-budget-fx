@@ -1,0 +1,14 @@
+[project]
+name = "ynab-multi-budget-fx"
+version = "0.1.0"
+description = "YNAB Multi-Budget FX Sync Tool"
+requires-python = ">=3.10"
+dependencies = [
+    "ynab",
+    "rich",
+    "questionary",
+    "httpx",
+]
+
+[project.scripts]
+ynab-multi-budget-fx = "ynab_multi_budget_fx:main"
