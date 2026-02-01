@@ -17,6 +17,7 @@ from ynab.rest import ApiException
 
 console = Console()
 CONFIG_PATH = Path.home() / ".local/share/ynab-multi-budget-fx/config.json"
+RATES_CACHE_PATH = Path.home() / ".local/share/ynab-multi-budget-fx/rates_cache.json"
 
 
 def milliunits_to_amount(milliunits: int, decimal_digits: int) -> float:
@@ -32,6 +33,17 @@ def load_config() -> dict | None:
 def save_config(cfg: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def load_rates_cache() -> dict[str, float]:
+    if RATES_CACHE_PATH.exists():
+        return json.loads(RATES_CACHE_PATH.read_text())
+    return {}
+
+
+def save_rates_cache(cache: dict[str, float]) -> None:
+    RATES_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RATES_CACHE_PATH.write_text(json.dumps(cache, indent=2))
 
 
 def get_ynab_client(api_key: str) -> ynab.ApiClient:
@@ -102,27 +114,60 @@ def fetch_fx_rates(base: str, target: str, dates: set[date]) -> dict[date, float
     rates = {}
     base_lower = base.lower()
     target_lower = target.lower()
-    failed_dates = []
 
-    def fetch_single_rate(d: date) -> tuple[date, float | None]:
+    cache = load_rates_cache()
+    dates_to_fetch = set()
+
+    for d in dates:
+        cache_key = f"{base_lower}:{target_lower}:{d.isoformat()}"
+        if cache_key in cache:
+            rates[d] = cache[cache_key]
+        else:
+            dates_to_fetch.add(d)
+
+    if not dates_to_fetch:
+        console.print(f"[dim]All {len(dates)} rates loaded from cache[/dim]")
+        return rates
+
+    if len(dates) > len(dates_to_fetch):
+        console.print(f"[dim]{len(dates) - len(dates_to_fetch)} rates loaded from cache[/dim]")
+
+    def fetch_rate(d: date, is_fallback: bool = False) -> tuple[date, float | None, Exception | None]:
         date_str = d.isoformat()
         urls = [
+            f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{date_str}/v1/currencies/{base_lower}.min.json",
+            f"https://{date_str}.currency-api.pages.dev/v1/currencies/{base_lower}.min.json"
             f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{date_str}/v1/currencies/{base_lower}.json",
             f"https://{date_str}.currency-api.pages.dev/v1/currencies/{base_lower}.json",
         ]
 
+        last_exc = None
         for url in urls:
             try:
                 resp = httpx.get(url, timeout=10, follow_redirects=True)
                 if resp.status_code == 200:
                     data = resp.json()
                     rate = data[base_lower][target_lower]
-                    return d, rate
-            except Exception:
-                continue
-        return d, None
+                    return d, rate, None
+                last_exc = Exception(f"HTTP {resp.status_code} from {url}")
+            except Exception as e:
+                last_exc = e
 
-    total = len(dates)
+        if not is_fallback:
+            # Sometimes published rates are not available for the date, fallback to previous day
+            console.print(
+                f"[yellow]Warning: No rate available for {d.isoformat()}, falling back to previous day[/yellow]"
+            )
+            _, rate, exc = fetch_rate(d - timedelta(days=1), True)
+            # However, return as of the requested date
+            return d, rate, exc
+
+        return d, None, last_exc
+
+    total = len(dates_to_fetch)
+    fetch_errors: dict[date, Exception] = {}
+    newly_fetched: dict[date, float] = {}
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -132,22 +177,30 @@ def fetch_fx_rates(base: str, target: str, dates: set[date]) -> dict[date, float
         completed = 0
 
         with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(fetch_single_rate, d): d for d in dates}
+            futures = {executor.submit(fetch_rate, d): d for d in dates_to_fetch}
 
             for future in as_completed(futures):
-                d, rate = future.result()
+                d, rate, exc = future.result()
                 if rate is not None:
                     rates[d] = rate
-                else:
-                    failed_dates.append(d)
+                    newly_fetched[d] = rate
+                elif exc:
+                    fetch_errors[d] = exc
                 completed += 1
                 progress.update(task, description=f"Fetching FX rates ({completed}/{total})...")
                 progress.advance(task)
 
-    if failed_dates:
-        for d in sorted(failed_dates):
-            console.print(f"[red]Failed to fetch rate for {d.isoformat()}[/red]")
+    if fetch_errors:
+        for d, exc in sorted(fetch_errors.items()):
+            error_msg = str(exc)
+            console.print(f"[red]Failed to fetch rate for {d.isoformat()}: {error_msg}[/red]")
         sys.exit(1)
+
+    if newly_fetched:
+        for d, rate in newly_fetched.items():
+            cache_key = f"{base_lower}:{target_lower}:{d.isoformat()}"
+            cache[cache_key] = rate
+        save_rates_cache(cache)
 
     return rates
 
@@ -161,7 +214,7 @@ def load_transactions(client: ynab.ApiClient, budget_id: str, since_date: str):
 def get_import_id(tx: Any) -> str:  #
     """
     We have little room here, as import_id is limited to 36 characters.
-    Using original transaction ID (uuid4, so with replace it's 32 characters) plus unique ID.
+    Using original transaction ID (uuid4, so without dashes it's 32 characters) plus some prefix.
     Hope there won't be any collisions if you sync from multiple sources.
     """
     return f"MB:{tx.id.replace('-', '')}"
@@ -172,7 +225,6 @@ def convert_transaction(
     rate: float,
     cat_map: dict,
     acc_map: dict,
-    src_budget_id: str,
     base_currency: str,
     decimal_digits: int,
 ) -> dict | None:
@@ -186,9 +238,9 @@ def convert_transaction(
     new_amount = int(tx.amount * rate)
 
     memo = tx.memo or ""
-    fx_info = f" ({orig_amount:.{decimal_digits}f} {base_currency} @{rate:.4f})"
+    fx_info = f" ({orig_amount:.{decimal_digits}f} {base_currency} @{1 / rate:.2f})"
     if len(memo) + len(fx_info) > 200:
-        memo = memo[: 200 - len(fx_info) - 3] + "..."
+        memo = memo[: 200 - len(fx_info) - 1] + "…"
     memo = memo + fx_info
 
     subtransactions = None
@@ -228,6 +280,7 @@ def sync_batch(client: ynab.ApiClient, budget_id: str, transactions: list[dict])
     api = ynab.TransactionsApi(client)
     wrapper = ynab.PostTransactionsWrapper(transactions=transactions)
     response = api.create_transaction(budget_id, wrapper)
+
     if dups := response.data.duplicate_import_ids:
         console.print("[yellow]Warning: Following transactions were not created due to duplicate import IDs:[/yellow]")
         for id in dups:
@@ -340,11 +393,12 @@ def main():
     if not client:
         client = get_ynab_client(cfg["api_key"])
 
-    with console.status("Validating budgets..."):
+    with console.status("Loading categories..."):
         dest_cats = load_categories(client, cfg["dest_budget_id"])
         src_cats = load_categories(client, cfg["src_budget_id"])
         cat_map, cat_errors = build_category_map(dest_cats, src_cats)
 
+    with console.status("Loading accounts..."):
         dest_accs = load_accounts(client, cfg["dest_budget_id"])
         src_accs = load_accounts(client, cfg["src_budget_id"])
         acc_map, acc_errors = build_account_map(dest_accs, src_accs)
@@ -399,7 +453,6 @@ def main():
                 rate,
                 cat_map,
                 acc_map,
-                cfg["src_budget_id"],
                 base_currency,
                 src_decimals,
             )
@@ -492,7 +545,7 @@ def main():
                     "amount": diff,
                     "payee_name": "Currency Rate Adjustment",
                     "category_id": adjustment_category_id,
-                    "memo": f"FX sync adjustment @{yesterday_rate:.4f}",
+                    "memo": f"FX sync adjustment @{1 / yesterday_rate:.2f}",
                     "approved": False,
                 }
                 with console.status("Creating adjustment..."):
