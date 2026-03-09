@@ -565,17 +565,20 @@ def main():
                 if not conv:
                     continue
 
-                # Check if amount or memo changed
+                # Check if amount, memo, or category changed
                 amount_changed = conv["amount"] != dest_tx.amount
                 memo_changed = conv["memo"] != (dest_tx.memo or "")
+                category_changed = conv["category_id"] != dest_tx.category_id
 
-                if amount_changed or memo_changed:
+                if amount_changed or memo_changed or category_changed:
                     update_data = {"id": dest_tx.id}
                     if amount_changed:
                         update_data["amount"] = conv["amount"]
                     if memo_changed:
                         update_data["memo"] = conv["memo"]
-                    updates_needed.append((src_tx, dest_tx, conv, update_data, amount_changed, memo_changed))
+                    if category_changed:
+                        update_data["category_id"] = conv["category_id"]
+                    updates_needed.append((src_tx, dest_tx, conv, update_data, amount_changed, memo_changed, category_changed))
 
             if updates_needed:
                 console.print(f"\n[cyan]{len(updates_needed)} transactions need updates[/cyan]\n")
@@ -585,7 +588,7 @@ def main():
                 table.add_column("Payee")
                 table.add_column("Changes", style="yellow")
 
-                for i, (src_tx, dest_tx, conv, update_data, amount_changed, memo_changed) in enumerate(updates_needed):
+                for i, (src_tx, dest_tx, conv, update_data, amount_changed, memo_changed, category_changed) in enumerate(updates_needed):
                     if i >= 20:
                         table.add_row("...", f"({len(updates_needed) - 20} more)", "")
                         break
@@ -596,6 +599,8 @@ def main():
                         changes.append(f"amount: {old_amt:.{dest_decimals}f} → {new_amt:.{dest_decimals}f}")
                     if memo_changed:
                         changes.append("memo updated")
+                    if category_changed:
+                        changes.append("category updated")
                     table.add_row(
                         str(src_tx.var_date),
                         src_tx.payee_name or "(no payee)",
