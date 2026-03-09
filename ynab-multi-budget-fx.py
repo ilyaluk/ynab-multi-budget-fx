@@ -95,14 +95,15 @@ def load_categories(client: ynab.ApiClient, budget_id: str) -> list[dict]:
     response = api.get_categories(budget_id)
     categories = []
     for group in response.data.category_groups:
-        if group.hidden or group.name in (
-            "Internal Master Category",
-            "Credit Card Payments",
-        ):
+        if group.name == "Internal Master Category":
+            for cat in group.categories:
+                if cat.name == "Inflow: Ready to Assign":
+                    categories.append({"id": cat.id, "name": cat.name, "group": group.name})
+            continue
+        if group.name == "Credit Card Payments":
             continue
         for cat in group.categories:
-            if not cat.hidden:
-                categories.append({"id": cat.id, "name": cat.name, "group": group.name})
+            categories.append({"id": cat.id, "name": cat.name, "group": group.name})
     return categories
 
 
@@ -565,10 +566,14 @@ def main():
                 if not conv:
                     continue
 
-                # Check if amount, memo, or category changed
+                # Check if amount or memo changed
                 amount_changed = conv["amount"] != dest_tx.amount
                 memo_changed = conv["memo"] != (dest_tx.memo or "")
-                category_changed = conv["category_id"] != dest_tx.category_id
+                # Skip category updates for split transactions
+                category_changed = (
+                    not conv["subtransactions"]
+                    and conv["category_id"] != dest_tx.category_id
+                )
 
                 if amount_changed or memo_changed or category_changed:
                     update_data = {"id": dest_tx.id}
@@ -586,11 +591,12 @@ def main():
                 table = Table(title="Transactions to Update")
                 table.add_column("Date", style="cyan")
                 table.add_column("Payee")
+                table.add_column(f"Amount ({target_currency})", justify="right")
                 table.add_column("Changes", style="yellow")
 
                 for i, (src_tx, dest_tx, conv, update_data, amount_changed, memo_changed, category_changed) in enumerate(updates_needed):
                     if i >= 20:
-                        table.add_row("...", f"({len(updates_needed) - 20} more)", "")
+                        table.add_row("...", f"({len(updates_needed) - 20} more)", "", "")
                         break
                     changes = []
                     if amount_changed:
@@ -601,9 +607,11 @@ def main():
                         changes.append("memo updated")
                     if category_changed:
                         changes.append("category updated")
+                    conv_amt = milliunits_to_amount(conv["amount"], dest_decimals)
                     table.add_row(
                         str(src_tx.var_date),
                         src_tx.payee_name or "(no payee)",
+                        f"{conv_amt:.{dest_decimals}f}",
                         ", ".join(changes),
                     )
                 console.print(table)
