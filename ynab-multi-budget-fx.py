@@ -646,7 +646,7 @@ def main():
         )
         console.print(f"  Difference:     {diff_display:+.{dest_decimals}f} {target_currency}")
 
-        if diff_display < 1:
+        if abs(diff_display) < 1:
             console.print("[yellow]Balance diff is less than 1 {target_currency}, skipping adjustment.[/yellow]")
             continue
 
